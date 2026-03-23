@@ -370,11 +370,17 @@ export const makeLeaderSyncProcessor = ({
       }).pipe(Effect.catchAllCause(maybeShutdownOnError), Effect.forkScoped)
 
       const backendPushingFiberHandle = yield* FiberHandle.make<void, never>()
+
+      // Flag set by the push fiber when it parks on Effect.never due to ServerAheadError.
+      // Used by restartBackendPushing in 'advance' case to decide whether to restart.
+      const pushFiberParked = { current: false }
+
       const backendPushingEffect = backgroundBackendPushing({
         syncBackendPushQueue,
         otelSpan,
         devtoolsLatch: ctxRef.current?.devtoolsLatch,
         backendPushBatchSize,
+        pushFiberParked,
       }).pipe(
         Effect.catchAllCause(maybeShutdownOnError),
       )
@@ -383,14 +389,25 @@ export const makeLeaderSyncProcessor = ({
 
       yield* backgroundBackendPulling({
         isClientEvent,
-        restartBackendPushing: (filteredRebasedPending) =>
+        restartBackendPushing: (filteredRebasedPending, { isRebase } = { isRebase: true }) =>
           Effect.gen(function* () {
+            if (!isRebase && !pushFiberParked.current) {
+              // On advance: only restart if the push fiber is parked (ServerAheadError).
+              // If the fiber is actively running (mid-push, waiting for queue, retrying),
+              // restarting would clear the queue and re-add events that may be in-flight,
+              // causing duplicate pushes when the interrupted HTTP request completes.
+              return
+            }
+
             // Stop current pushing fiber
             yield* FiberHandle.clear(backendPushingFiberHandle)
 
             // Reset the sync backend push queue
             yield* BucketQueue.clear(syncBackendPushQueue)
             yield* BucketQueue.offerAll(syncBackendPushQueue, filteredRebasedPending)
+
+            // Reset parked flag for the new fiber
+            pushFiberParked.current = false
 
             // Restart pushing fiber
             yield* FiberHandle.run(backendPushingFiberHandle, backendPushingEffect)
@@ -710,6 +727,7 @@ const backgroundBackendPulling = Effect.fn('@livestore/common:LeaderSyncProcesso
   isClientEvent: (eventEncoded: LiveStoreEvent.Client.EncodedWithMeta) => boolean
   restartBackendPushing: (
     filteredRebasedPending: ReadonlyArray<LiveStoreEvent.Client.EncodedWithMeta>,
+    options?: { isRebase: boolean },
   ) => Effect.Effect<void, never, LeaderThreadCtx | HttpClient.HttpClient>
   otelSpan: otel.Span | undefined
   syncStateSref: SubscriptionRef.SubscriptionRef<SyncState.SyncState | undefined>
@@ -818,12 +836,14 @@ const backgroundBackendPulling = Effect.fn('@livestore/common:LeaderSyncProcesso
             undefined,
           )
 
-          // Ensure push fiber is active after advance by restarting with current pending (non-client) events
+          // Restart push fiber only if it's parked (ServerAheadError).
+          // When the push fiber is actively running, restarting would cause duplicate pushes
+          // because in-flight HTTP requests may have already committed events to the backend.
           const globalPendingEvents = mergeResult.newSyncState.pending.filter((event) => {
             const eventDef = schema.eventsDefsMap.get(event.name)
             return eventDef === undefined ? true : eventDef.options.clientOnly === false
           })
-          yield* restartBackendPushing(globalPendingEvents)
+          yield* restartBackendPushing(globalPendingEvents, { isRebase: false })
 
           yield* connectedClientSessionPullQueues.offer({
             payload: SyncState.payloadFromMergeResult(mergeResult),
@@ -910,11 +930,13 @@ const backgroundBackendPushing = Effect.fn('@livestore/common:LeaderSyncProcesso
   otelSpan,
   devtoolsLatch,
   backendPushBatchSize,
+  pushFiberParked,
 }: {
   syncBackendPushQueue: BucketQueue.BucketQueue<LiveStoreEvent.Client.EncodedWithMeta>
   otelSpan: otel.Span | undefined
   devtoolsLatch: Effect.Latch | undefined
   backendPushBatchSize: number
+  pushFiberParked: { current: boolean }
 }) {
   const { syncBackend } = yield* LeaderThreadCtx
   if (syncBackend === undefined) return
@@ -968,6 +990,8 @@ const backgroundBackendPushing = Effect.fn('@livestore/common:LeaderSyncProcesso
         if (error._tag === 'InvalidPushError' && error.cause._tag === 'ServerAheadError') {
           // It's a core part of the sync protocol that the sync backend will emit a new pull chunk alongside the ServerAheadError
           yield* Effect.logDebug('handled backend-push-error (waiting for interupt caused by pull)', { error })
+          // Signal that the push fiber is parked, so restartBackendPushing knows to restart it.
+          pushFiberParked.current = true
           return yield* Effect.never
         }
 
@@ -984,6 +1008,7 @@ const backgroundBackendPushing = Effect.fn('@livestore/common:LeaderSyncProcesso
       // This is needed to narrow the Error type. Our retry policy runs indefinitely, but Effect.retry does not narrow the Error type.
       Effect.catchTag("IsOfflineError", Effect.die),
     )
+
   }
 }, Effect.interruptible)
 

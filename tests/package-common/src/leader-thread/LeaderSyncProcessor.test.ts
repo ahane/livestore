@@ -459,6 +459,82 @@ Vitest.describe.concurrent('LeaderSyncProcessor', { timeout: 60000 }, () => {
   )
 
   /**
+   * Regression test for duplicate backend push bug.
+   * 
+   * Bug: When pushing events while backend advances arrive (SSE), the
+   * sync processor would sometimes push the same batch twice because
+   * `restartBackendPushing()` was called in the 'advance' case, which
+   * re-queued events that were already in-flight.
+   * 
+   * Fix: Only call restartBackendPushing() on 'rebase', not on 'advance'.
+   */
+  Vitest.scopedLive('rapid pushes with concurrent advances should not duplicate', (test) =>
+    Effect.gen(function* () {
+      const testContext = yield* TestContext
+      const eventFactory = testContext.eventFactory
+      const backendFactory = makeEventFactory({
+        client: EventFactory.clientIdentity('mock-backend', 'backend-session'),
+      })
+
+      // Collect all pushed seqNums
+      const pushedSeqNums: number[] = []
+      
+      // Fork a fiber to collect pushed events
+      const collector = yield* testContext.mockSyncBackend.pushedEvents.pipe(
+        Stream.tap((event) => Effect.sync(() => {
+          // Extract seqNum from encoded event (JSON string or object)
+          const parsed = typeof event === 'string' ? JSON.parse(event) : event
+          pushedSeqNums.push(parsed.seqNum)
+        })),
+        Stream.runDrain,
+        Effect.fork,
+      )
+
+      // Push 50 events rapidly while backend advances arrive concurrently
+      yield* Effect.all([
+        // Rapid local pushes
+        Effect.forEach(
+          Array.from({ length: 50 }, (_, i) => i),
+          (i) => testContext.pushEncoded(
+            eventFactory.todoCreated.next({ id: `local-${i}`, text: `event ${i}`, completed: false })
+          ),
+          { concurrency: 'unbounded' },
+        ),
+        // Concurrent backend advances to trigger 'advance' code path
+        Effect.gen(function* () {
+          yield* Effect.sleep(5)
+          for (let i = 0; i < 3; i++) {
+            yield* testContext.mockSyncBackend.advance(
+              backendFactory.todoCreated.next({ id: `backend-${i}`, text: `backend ${i}`, completed: false })
+            )
+            yield* Effect.sleep(5)
+          }
+        }),
+      ], { concurrency: 'unbounded' })
+
+      // Wait for pushes to complete
+      yield* Effect.sleep(200)
+
+      // Check for duplicate seqNums
+      const seqNumCounts = new Map<number, number>()
+      for (const seqNum of pushedSeqNums) {
+        seqNumCounts.set(seqNum, (seqNumCounts.get(seqNum) ?? 0) + 1)
+      }
+      
+      const duplicates = Array.from(seqNumCounts.entries())
+        .filter(([_, count]) => count > 1)
+        .map(([seqNum, count]) => ({ seqNum, count }))
+
+      // No duplicates should exist
+      expect(duplicates).toHaveLength(0)
+    }).pipe(
+      withTestCtx({
+        params: { localPushBatchSize: 10, backendPushBatchSize: 50 },
+      })(test),
+    ),
+  )
+
+  /**
    * Session A pushes e1…e6 through the public `push` API while session B (same
    * client, different session) wakes with stale state and enqueues [e2, e7, e8]. The leader should
    * reject the batch with `LeaderAheadError`, forcing session B to rebase locally.
@@ -555,6 +631,62 @@ Vitest.describe.concurrent('LeaderSyncProcessor', { timeout: 60000 }, () => {
 
       yield* testContext.mockSyncBackend.pushedEvents.pipe(Stream.take(1), Stream.runDrain, Effect.timeout(5000))
     }).pipe(withTestCtx()(test)),
+  )
+
+  /**
+   * Regression test: ServerAheadError parks the push fiber, then advance confirms some events
+   * but leaves others still pending. The pending events must be re-queued and eventually pushed.
+   * 
+   * This tests that the pushFiberParked flag correctly triggers restart on advance,
+   * and that pending events are not lost.
+   */
+  Vitest.scopedLive('ServerAheadError with advance does not lose pending events', (test) =>
+    Effect.gen(function* () {
+      const testContext = yield* TestContext
+      const leaderThreadCtx = yield* LeaderThreadCtx
+      const eventFactory = testContext.eventFactory
+      const backendFactory = makeEventFactory({
+        client: EventFactory.clientIdentity('mock-backend', 'static-session-id'),
+      })
+
+      // Make the next push fail with ServerAheadError so the push fiber parks
+      yield* testContext.mockSyncBackend.failNextPushes(
+        1,
+        () =>
+          new InvalidPushError({
+            cause: new ServerAheadError({
+              minimumExpectedNum: EventSequenceNumber.Global.make(2),
+              providedNum: EventSequenceNumber.Global.make(1),
+            }),
+          }),
+      )
+
+      // Push two events — push will fail with ServerAheadError, fiber parks
+      yield* testContext.pushEncoded(
+        eventFactory.todoCreated.next({ id: 'e1', text: 'first', completed: false }),
+        eventFactory.todoCreated.next({ id: 'e2', text: 'second', completed: false }),
+      )
+
+      // Wait for the push fiber to park on Effect.never
+      yield* Effect.sleep(100)
+
+      // Backend sends a new event via pull. Since this is a different clientId,
+      // it causes a rebase (local pending e1+e2 diverge from backend event).
+      // After the rebase, the push fiber must restart and push the rebased events.
+      yield* testContext.mockSyncBackend.advance(
+        backendFactory.todoCreated.next({ id: 'backend-1', text: 'backend event', completed: false }),
+      )
+
+      // Rebased e1 and e2 should eventually be pushed to the backend
+      yield* testContext.mockSyncBackend.pushedEvents.pipe(Stream.take(2), Stream.runDrain, Effect.timeout(5000))
+
+      // Verify all events are materialized locally
+      const rows = leaderThreadCtx.dbState.select<{ id: string }>(tables.todos.asSql().query)
+      const ids = rows.map((r) => r.id).toSorted()
+      expect(ids).toContain('e1')
+      expect(ids).toContain('e2')
+      expect(ids).toContain('backend-1')
+    }).pipe(withTestCtx({ params: { backendPushBatchSize: 10 } })(test)),
   )
 
   // - test for filtering out local push queue items with an older rebase generation
